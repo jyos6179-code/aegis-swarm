@@ -26,11 +26,40 @@ const ai = process.env.GEMINI_API_KEY
     })
   : null;
 
+// Track API rate-limiting so quota exhaustion (HTTP 429) gracefully uses the autonomous engine
+let geminiRateLimitedUntil = 0;
+
+function handleRateLimitError(err: any): boolean {
+  const errStr = String(err?.message || err || '');
+  const isRateLimit =
+    err?.status === 429 ||
+    err?.code === 429 ||
+    errStr.includes('429') ||
+    errStr.includes('RESOURCE_EXHAUSTED') ||
+    errStr.includes('quota');
+
+  if (isRateLimit) {
+    const delayMatch =
+      errStr.match(/retry in ([0-9.]+)s/i) ||
+      errStr.match(/retryDelay":"([0-9]+)s/i);
+    const delaySec = delayMatch ? Math.ceil(parseFloat(delayMatch[1])) : 45;
+    geminiRateLimitedUntil = Date.now() + delaySec * 1000;
+    console.warn(
+      `[Gemini Rate Limit] Quota reached. Backing off for ${delaySec}s. Autonomous engine seamlessly active.`
+    );
+    return true;
+  }
+  return false;
+}
+
 // Health check endpoint
 app.get('/api/health', (_req, res) => {
+  const isRateLimited = Date.now() < geminiRateLimitedUntil;
   res.json({
     status: 'online',
     hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+    isRateLimited,
+    retryAfterSec: isRateLimited ? Math.ceil((geminiRateLimitedUntil - Date.now()) / 1000) : 0,
     timestamp: new Date().toISOString(),
   });
 });
@@ -53,7 +82,9 @@ app.post('/api/multi-agent/turn', async (req, res) => {
       return res.status(400).json({ error: 'agentRole and task are required' });
     }
 
-    if (ai && process.env.GEMINI_API_KEY) {
+    const isCurrentlyRateLimited = Date.now() < geminiRateLimitedUntil;
+
+    if (ai && process.env.GEMINI_API_KEY && !isCurrentlyRateLimited) {
       // System instructions tuned for each specialized agent role
       const systemPrompts: Record<string, string> = {
         tracker: `You are the TRACKER agent in an autonomous multi-agent triad (Tracker, Predictor, Commander).
@@ -157,57 +188,67 @@ Injected Environmental Chaos: ${injectedChaos ? JSON.stringify(injectedChaos) : 
 
 Think deeply as the ${agentRole.toUpperCase()} agent. Produce your next autonomous action, internal monologue, communication message, and tool invocation. Return strictly valid JSON.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: userContent,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          temperature: 0.7,
-        },
-      });
-
-      const responseText = response.text?.trim() || '{}';
       try {
-        const parsed = JSON.parse(responseText);
-        return res.json({ success: true, result: parsed, source: 'gemini-3.8-flash' });
-      } catch (parseErr) {
-        console.warn('JSON parsing failed from Gemini response, using fallback parse:', parseErr);
-        // Clean markdown backticks if any
-        const cleaned = responseText.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
-        const parsedCleaned = JSON.parse(cleaned);
-        return res.json({ success: true, result: parsedCleaned, source: 'gemini-3.8-flash' });
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.8-flash',
+          contents: userContent,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            temperature: 0.7,
+          },
+        });
+
+        const responseText = response.text?.trim() || '{}';
+        try {
+          const parsed = JSON.parse(responseText);
+          return res.json({ success: true, result: parsed, source: 'gemini-3.8-flash' });
+        } catch (parseErr) {
+          const cleaned = responseText.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+          const parsedCleaned = JSON.parse(cleaned);
+          return res.json({ success: true, result: parsedCleaned, source: 'gemini-3.8-flash' });
+        }
+      } catch (geminiCallErr: any) {
+        handleRateLimitError(geminiCallErr);
+        // Seamlessly return the autonomous engine turn
+        return res.json({
+          success: true,
+          result: generateAutonomousTurnFallback(agentRole, task, round, blackboardState, injectedChaos),
+          source: 'heuristic_autonomous_engine',
+          rateLimited: true,
+        });
       }
     }
 
-    // Fallback engine if no GEMINI_API_KEY is configured
+    // High-fidelity autonomous engine if no key or rate-limited
     return res.json({
       success: true,
       result: generateAutonomousTurnFallback(agentRole, task, round, blackboardState, injectedChaos),
       source: 'heuristic_autonomous_engine',
+      rateLimited: isCurrentlyRateLimited,
     });
   } catch (err: any) {
-    console.error('Error in multi-agent turn endpoint:', err);
-    // Even if Gemini network issues occur, provide resilient autonomous fallback
+    handleRateLimitError(err);
     const { agentRole, task, round, blackboardState, injectedChaos } = req.body || {};
     return res.json({
       success: true,
       result: generateAutonomousTurnFallback(agentRole || 'tracker', task || { title: 'Emergency Task' }, round || 1, blackboardState, injectedChaos),
       source: 'resilient_engine_fallback',
-      warning: err.message,
     });
   }
 });
 
 // Dynamic Task Generator Endpoint
 app.post('/api/multi-agent/generate-task', async (req, res) => {
-  try {
-    const { promptTopic } = req.body;
-    if (!promptTopic) {
-      return res.status(400).json({ error: 'promptTopic is required' });
-    }
+  const { promptTopic } = req.body;
+  if (!promptTopic) {
+    return res.status(400).json({ error: 'promptTopic is required' });
+  }
 
-    if (ai && process.env.GEMINI_API_KEY) {
+  const isCurrentlyRateLimited = Date.now() < geminiRateLimitedUntil;
+
+  if (ai && process.env.GEMINI_API_KEY && !isCurrentlyRateLimited) {
+    try {
       const response = await ai.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: `Create a high-stakes, realistic complex system problem for a 3-agent autonomous swarm (Tracker, Predictor, Commander) based on this prompt: "${promptTopic}".
@@ -233,66 +274,66 @@ Return strictly valid JSON with this schema:
 
       const parsed = JSON.parse(response.text?.trim() || '{}');
       return res.json({ success: true, task: parsed });
+    } catch (genErr: any) {
+      handleRateLimitError(genErr);
+      // Fall through to heuristic generator
     }
-
-    // Heuristic generator
-    const sampleTask = {
-      id: `task-${Date.now()}`,
-      title: `${promptTopic} Autonomous Mission`,
-      domain: 'Complex Systems Engineering',
-      objective: `Stabilize and resolve anomalies in ${promptTopic} without human intervention`,
-      initialCrisisLevel: 82,
-      background: `System sensors report cascading deviations in ${promptTopic}. Multiple subsystems are exhibiting non-linear threshold degradation.`,
-      initialAnomalies: [
-        { metric: `${promptTopic} Primary Throughput`, deviation: '-38.4% below nominal', severity: 'critical' },
-        { metric: `${promptTopic} Error Rate Index`, deviation: '+192% spike', severity: 'warning' },
-      ],
-      keyTelemetryMetrics: ['System Ingestion Rate', 'Component Health Vector', 'Cascade Risk Index', 'Subsystem Cohesion'],
-    };
-    return res.json({ success: true, task: sampleTask });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
   }
+
+  // Heuristic generator fallback
+  const sampleTask = {
+    id: `task-${Date.now()}`,
+    title: `${promptTopic} Autonomous Mission`,
+    domain: 'Complex Systems Engineering',
+    objective: `Stabilize and resolve anomalies in ${promptTopic} without human intervention`,
+    initialCrisisLevel: 82,
+    background: `System sensors report cascading deviations in ${promptTopic}. Multiple subsystems are exhibiting non-linear threshold degradation.`,
+    initialAnomalies: [
+      { metric: `${promptTopic} Primary Throughput`, deviation: '-38.4% below nominal', severity: 'critical' },
+      { metric: `${promptTopic} Error Rate Index`, deviation: '+192% spike', severity: 'warning' },
+    ],
+    keyTelemetryMetrics: ['System Ingestion Rate', 'Component Health Vector', 'Cascade Risk Index', 'Subsystem Cohesion'],
+  };
+  return res.json({ success: true, task: sampleTask });
 });
 
 // Multi-turn Gemini Chatbot Endpoint
 app.post('/api/chat', async (req, res) => {
-  try {
-    const { role = 'commander', messages = [], currentTask, blackboardState } = req.body;
+  const { role = 'commander', messages = [], currentTask, blackboardState } = req.body;
 
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: 'messages array is required' });
-    }
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages array is required' });
+  }
 
-    const systemPrompts: Record<string, string> = {
-      tracker: `You are Sentinel-Tracker, the empirical observation and sensor telemetry specialist in the Aegis Swarm autonomous triad.
+  const systemPrompts: Record<string, string> = {
+    tracker: `You are Sentinel-Tracker, the empirical observation and sensor telemetry specialist in the Aegis Swarm autonomous triad.
 Current Mission: "${currentTask?.title || 'Operational Emergency'}" (${currentTask?.domain || 'General Systems'}).
 Blackboard Status: Crisis Level ${blackboardState?.crisisLevel ?? 75}%, Stability ${blackboardState?.stabilityScore ?? 25}%.
 Your perspective: You focus on raw measurements, sigma-variance, latency jitter, and empirical sensor ground truth. You do not speculate on long-term futures (that is Predictor's duty) or give executive orders (that is Commander's duty). Answer the human operator concisely, authoritatively, and grounded in empirical telemetry.`,
-      predictor: `You are Oracle-Predictor, the stochastic simulation and cascade forecasting specialist in the Aegis Swarm autonomous triad.
+    predictor: `You are Oracle-Predictor, the stochastic simulation and cascade forecasting specialist in the Aegis Swarm autonomous triad.
 Current Mission: "${currentTask?.title || 'Operational Emergency'}" (${currentTask?.domain || 'General Systems'}).
 Blackboard Status: Crisis Level ${blackboardState?.crisisLevel ?? 75}%, Stability ${blackboardState?.stabilityScore ?? 25}%.
 Your perspective: You think in Monte Carlo trajectories, probabilistic risk frontiers, failure horizons (Immediate T+15m, Mid T+30m, Terminal T+60m), and counterfactual "what-if" trade-offs. Answer the human operator with calculated probabilities, risk surfaces, and analytical rigor.`,
-      commander: `You are Vanguard-Commander, the executive decision maker and tactical dispatcher in the Aegis Swarm autonomous triad.
+    commander: `You are Vanguard-Commander, the executive decision maker and tactical dispatcher in the Aegis Swarm autonomous triad.
 Current Mission: "${currentTask?.title || 'Operational Emergency'}" (${currentTask?.domain || 'General Systems'}).
 Blackboard Status: Crisis Level ${blackboardState?.crisisLevel ?? 75}%, Stability ${blackboardState?.stabilityScore ?? 25}%.
 Your perspective: You synthesize Tracker's telemetry facts and Predictor's risk projections to execute decisive interventions via shared tools (Resource Allocator, Protocol Enforcer). Answer the human operator with strategic clarity, decisiveness, and mission accountability.`,
-      coordinator: `You are the Aegis Swarm Master Intelligence Coordinator, overseeing the autonomous triad (Tracker, Predictor, Commander).
+    coordinator: `You are the Aegis Swarm Master Intelligence Coordinator, overseeing the autonomous triad (Tracker, Predictor, Commander).
 Current Mission: "${currentTask?.title || 'Operational Emergency'}" (${currentTask?.domain || 'General Systems'}).
 Blackboard Status: Crisis Level ${blackboardState?.crisisLevel ?? 75}%, Stability ${blackboardState?.stabilityScore ?? 25}%.
 Synthesize the whole triad's perspective, explain why tools were chosen, and provide clear executive visibility to the human operator.`,
-    };
+  };
 
-    const systemInstruction = systemPrompts[role] || systemPrompts.commander;
+  const systemInstruction = systemPrompts[role] || systemPrompts.commander;
+  const isCurrentlyRateLimited = Date.now() < geminiRateLimitedUntil;
 
-    if (ai && process.env.GEMINI_API_KEY) {
-      // Map multi-turn conversation history for @google/genai
+  if (ai && process.env.GEMINI_API_KEY && !isCurrentlyRateLimited) {
+    try {
       const contents = messages.map((m: any) => ({
         role: m.role === 'model' || m.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: String(m.content || m.text || '') }],
       }));
 
-      // Use gemini-3.8-flash for general multi-turn reasoning per guidelines
       const response = await ai.models.generateContent({
         model: 'gemini-3.8-flash',
         contents,
@@ -304,21 +345,16 @@ Synthesize the whole triad's perspective, explain why tools were chosen, and pro
 
       const replyText = response.text || 'Directive acknowledged.';
       return res.json({ success: true, text: replyText, model: 'gemini-3.8-flash' });
+    } catch (chatApiErr: any) {
+      handleRateLimitError(chatApiErr);
+      // Fall through to heuristic chat fallback
     }
-
-    // Heuristic multi-turn fallback if no Gemini key configured
-    const lastUserMsg = messages[messages.length - 1]?.content || '';
-    const fallbackReply = generateChatFallback(role, lastUserMsg, currentTask, blackboardState);
-    return res.json({ success: true, text: fallbackReply, model: 'heuristic_operator_engine' });
-  } catch (err: any) {
-    console.error('Error in /api/chat:', err);
-    return res.json({
-      success: true,
-      text: `[${(req.body?.role || 'commander').toUpperCase()}] Signal acknowledged. Operations continuing under current parameters. (Telemetry variance within tolerance).`,
-      model: 'fallback',
-      warning: err.message,
-    });
   }
+
+  // Heuristic multi-turn fallback
+  const lastUserMsg = messages[messages.length - 1]?.content || '';
+  const fallbackReply = generateChatFallback(role, lastUserMsg, currentTask, blackboardState);
+  return res.json({ success: true, text: fallbackReply, model: 'heuristic_operator_engine' });
 });
 
 function generateChatFallback(role: string, query: string, task: any, blackboard: any) {
