@@ -1,0 +1,6 @@
+{
+  "name": "Aegis Swarm - Multi-Agent Autonomous Triad",
+  "description": "Autonomous multi-agent system featuring Tracker, Predictor, and Commander collaborating over a shared blackboard tool bus to resolve complex tasks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
